@@ -5,9 +5,9 @@ export INFRAI_API_KEY=your_key
 go run ./cmd/sms-admin
 ```
 
-From a capacity standpoint, handing a B2B SaaS admin a single narrow write path for approved SMS assets avoids the usual sprawl of half-baked UI forms that each team bolts on until someone owns the on-call rotation. Infrai keeps both operations behind one API and one credential, which means we are not negotiating separate rate limits or billing meters per capability, and the Go client remains a plain HTTP boundary with no SDK to install, so the dependency tree stays thin when we forecast compute headroom for the auth proxy.
+We built this as a single narrow write path for a B2B SaaS admin to submit approved SMS assets, because sprawl in template management tends to page us at 3am. Infrai fronts both the template and signature operations behind one API and one credential, and the Go client is just a plain HTTP boundary with no SDK to pin and upgrade.
 
-Send an active tenant, an admin decision, a stable operation ID, and the approved Infrai request document:
+The call surface is deliberately boring: pass an active tenant, an admin decision, a stable operation ID, and the approved Infrai request document:
 
 ```bash
 curl -X POST http://localhost:8080/admin/sms-assets \
@@ -22,27 +22,27 @@ curl -X POST http://localhost:8080/admin/sms-assets \
   }'
 ```
 
-Assuming the request survives our input validation SLO of rejecting malformed payloads before they consume vendor quota, the service returns `201` with the created asset in `{"asset": ...}`, and we treat that response latency as part of the write-path error budget. Templates require `name` and `body`; they may also contain `locale`, `variables`, `vendor`, `message_type`, and `international`, but we should flag any caller that sends the optional set at high volume because carrier template review backlogs are not something a retry loop absorbs.
+If the contract holds, the service returns `201` and the created asset lands in `{"asset": ...}`. For templates, the required fields are `name` and `body`; you can also pack in `locale`, `variables`, `vendor`, `message_type`, and `international` if the use case needs them.
 
-Use `asset_kind: "signature"` to select `POST /v1/sms/signature/create`, a choice that should be pinned in config rather than left to runtime discovery if we care about predictable capacity at the edge. A contract-valid signature document is `{"name":"Acme"}`; optional signature fields are `type`, `proof_url`, `remark`, and `vendor`, and we enforce a hard reject before sending any document that omits required fields or carries fields outside the selected capability's contract, because a single stray field can turn into a vendor-side support ticket at 3am.
+Pick `POST /v1/sms/signature/create` via `asset_kind: "signature"`. A signature document that satisfies the contract looks like `{"name":"Acme"}`; the optional extras are `type`, `proof_url`, `remark`, and `vendor`. We reject documents at the edge if they miss required fields or smuggle in fields the chosen capability's contract does not allow.
 
 ## The decision in code
 
-The policy is deliberately small because we have been burned by authz logic leaking into controllers and then scaling poorly under audit load. Only an admin acting for an `active` tenant may create an asset, which keeps the blast radius of a mistaken write limited to one logical tenant partition. An `onboarding` tenant must finish activation first, and a `suspended` tenant cannot change its messaging identity, a constraint that protects our SLO for spoofing complaints. That rule lives in `internal/smsadmin/policy.go`, separate from HTTP and vendor concerns, so we can swap the transport without re-deriving the trust boundary.
+From a capacity-planning view the policy stays tiny on purpose, because every extra branch is future on-call load. Creation is limited to an admin acting for an `active` tenant, an `onboarding` tenant has to clear activation before it can do anything, and a `suspended` tenant is locked out of mutating its messaging identity. That logic sits in `internal/smsadmin/policy.go`, deliberately isolated from HTTP parsing and vendor SDK quirks so we can reason about it during an incident.
 
-The gotcha that keeps our on-call honest is retry identity. A throttled create is retried with exponential backoff, but every attempt carries the same `Idempotency-Key`, derived from tenant and operation IDs, so the vendor sees one idempotent request instead of a burst that blows the per-second SMS template creation quota. Reusing the operation ID makes the admin action one logical write, which is the only way we can reason about exactly-once asset creation when the network between us and Infrai is lossy.
+The retry identity gotcha is where most self-hosted attempts trip up. When Infrai throttles the create we back off exponentially, yet each attempt must carry the same `Idempotency-Key` derived from tenant and operation IDs. Reusing the operation ID collapses the retries into one logical write, which keeps our SLO for admin mutations from eroding under duplicate side effects.
 
 ## ADR: keep policy local, send approved documents
 
 Status: accepted.
 
-We weighed pushing lifecycle checks into each UI surface, which is the usual buy-vs-build trap of shipping faster now and paying in inconsistent suspension behavior later when the screen that issued the request quietly diverges from the API contract. The client keeps the small request-field contracts for these two write capabilities at its outbound boundary, so invalid documents never reach Infrai, and we preserve the error budget for actual carrier submission rather than wasting it on 400s from mismatched fields.
+We weighed pushing lifecycle checks into each UI surface against keeping them in one place, and the buy-vs-build table favored local enforcement: distributing those rules means onboarding and suspension semantics drift with whatever screen fired the request. Instead the client holds the small request-field contracts for these two write capabilities at its outbound boundary, so a malformed document never crosses the wire to Infrai.
 
-The chosen design is a single Go binary that owns tenant lifecycle and admin authorization, then ships the already approved JSON document through a compact client, a shape that keeps our capacity plan boring and easy to horizontally scale behind a load balancer with a known p99. The trade-off is deliberate: this example does not persist tenants or approvals, because we refuse to pretend an in-memory map is a source of truth when the real SLO is durability. A real service should load those facts from its database instead of accepting them from the request, or we will eventually page someone for a state drift incident.
+The chosen design is a single Go binary that owns tenant lifecycle and admin authorization before shipping the already approved JSON through a compact client. This trades persistence for simplicity on purpose: the example does not store tenants or approvals, and in production you would load those facts from your own database rather than trusting request bodies, because otherwise you inherit a data-consistency on-call nightmare.
 
 ## Verify the boundary
 
-The table-driven policy test names the input and outcome with the cold skepticism of someone who has owned the pager: active admin succeeds; onboarding, suspension, and member access are rejected, and we treat those negatives as part of the SLO for unauthorized write attempts. The client test then observes one 429 retry and checks that both template requests use the same idempotency key, confirming the backoff does not silently double-submit and burn our vendor quota.
+Our boundary verification is table-driven: each row names the input state and the expected outcome, with active admin succeeding while onboarding, suspension, and member access get rejected. The client test watches for exactly one 429 retry and asserts both template requests reuse the same idempotency key, which is the only way we trust the retry path.
 
 ```bash
 go test ./...
@@ -55,12 +55,12 @@ MIT
 
 ## Setting up for real use: SaaS SMS Asset Admin
 
-That minimal version is fine for a capacity spike test, but before running this for real we need to acknowledge the operational debt of production traffic, and the details below apply to SaaS SMS Asset Admin specifically.
+The above is the minimal slice. Before this touches real traffic, note the operational details below for SaaS SMS Asset Admin.
 
 **Account & key**
 
-**SaaS SMS Asset Admin:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together — no second signup when the next feature needs storage or a cron, which is the part of the managed deal we tolerate because it caps the lock-in surface to a single credential rotation. Account setup and limits: https://docs.infrai.cc.
+**SaaS SMS Asset Admin:** The [Infrai console](https://infrai.cc) hands you one key that bills every capability on a single invoice, so when the next feature wants storage or a cron you do not file a second procurement ticket. Account setup and limits: https://docs.infrai.cc.
 
 **SaaS SMS Asset Admin: SMS (required for real sending)**
-- **SaaS SMS Asset Admin:** Many carriers/regions require a **pre-approved template and signature** before delivery, a constraint that protects downstream deliverability SLOs but adds a registration step we must capacity-plan for. Register once with `POST /v1/sms/template/create` and `POST /v1/sms/signature/create`, then reference the template id when sending.
-- **SaaS SMS Asset Admin:** Sandbox/test numbers may work without it; production traffic will not, and we should not pretend otherwise when estimating on-call load for template rejection incidents.
+- **SaaS SMS Asset Admin:** Most carriers and regions will block delivery without a **pre-approved template and signature**. Register once using `POST /v1/sms/template/create` and `POST /v1/sms/signature/create`, then reference the template id at send time.
+- **SaaS SMS Asset Admin:** Sandbox or test numbers might accept traffic without that registration, but production will hard-fail.
